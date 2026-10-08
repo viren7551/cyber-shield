@@ -24,11 +24,12 @@ export const connectDB = async () => {
 };
 
 // Retry connection in background if offline (every 10s)
-setInterval(() => {
+const retryInterval = setInterval(() => {
   if (!isConnected) {
     connectDB();
   }
 }, 10000);
+if (retryInterval.unref) retryInterval.unref();
 
 export const getDBStatus = () => ({
   connected: isConnected,

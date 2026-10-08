@@ -6,6 +6,7 @@ import {
   ipIntelHandler,
   dnsMapHandler,
   usernameSearchHandler,
+  usernameStreamHandler,
   emailIntelHandler,
   techDetectionHandler,
   dorkBuilderHandler,
@@ -19,6 +20,7 @@ router.get('/subdomains', subdomainsHandler);
 router.get('/whois', whoisHandler);
 router.get('/ip', ipIntelHandler);
 router.get('/dns-map', dnsMapHandler);
+router.get('/username/stream', usernameStreamHandler);
 router.get('/username', usernameSearchHandler);
 router.get('/email', emailIntelHandler);
 router.get('/tech', techDetectionHandler);

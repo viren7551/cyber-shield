@@ -57,12 +57,67 @@ export const dnsMapHandler = async (req, res) => {
 
 export const usernameSearchHandler = async (req, res) => {
   try {
-    const { username } = req.query;
+    const { username, scope = 'all' } = req.query;
     if (!username) return res.status(400).json({ success: false, error: 'Target username is required.' });
-    const data = await OsintEngine.searchUsername(username);
+    const data = await OsintEngine.searchUsername(username, { scope });
     return res.status(200).json({ success: true, data });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
+  }
+};
+
+export const usernameStreamHandler = async (req, res) => {
+  const { username, scope = 'all' } = req.query;
+  if (!username) {
+    return res.status(400).json({ success: false, error: 'Target username is required.' });
+  }
+
+  // Set SSE Headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (typeof res.flushHeaders === 'function') {
+    res.flushHeaders();
+  }
+
+  const abortController = new AbortController();
+  req.on('close', () => {
+    abortController.abort();
+  });
+
+  const sendEvent = (event, data) => {
+    try {
+      res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      if (typeof res.flush === 'function') res.flush();
+    } catch {}
+  };
+
+  try {
+    const summary = await OsintEngine.searchUsername(username, {
+      scope,
+      signal: abortController.signal,
+      onProgress: (progress) => {
+        if (progress.result && progress.result.exists) {
+          sendEvent('found', progress.result);
+        }
+        sendEvent('progress', {
+          scanned: progress.scanned,
+          total: progress.total,
+          percent: progress.percent,
+          foundCount: progress.foundCount,
+          currentPlatform: progress.result?.platform
+        });
+      }
+    });
+
+    sendEvent('complete', summary);
+  } catch (err) {
+    if (!abortController.signal.aborted) {
+      sendEvent('error', { error: err.message });
+    }
+  } finally {
+    res.end();
   }
 };
 
