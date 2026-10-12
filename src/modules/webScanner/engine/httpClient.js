@@ -167,6 +167,7 @@ export async function safeRequest(targetUrl, options = {}) {
       success: false,
       url: currentUrl,
       requestedUrl: targetUrl,
+      statusCode: 0,
       error: err.message,
       code: err.code || 'REQUEST_FAILED',
       redirectChain,

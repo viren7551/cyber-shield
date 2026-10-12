@@ -138,7 +138,17 @@ export async function verifyPayloadsStreamHandler(req, res) {
     }
 
     const abortController = new AbortController();
+    
+    // Cloud Proxy Keep-Alive Heartbeat (prevents Netlify, Cloudflare, & Render 15-30s idle disconnects)
+    const keepAliveInterval = setInterval(() => {
+      try {
+        res.write(': keep-alive\n\n');
+        if (typeof res.flush === 'function') res.flush();
+      } catch {}
+    }, 7500);
+
     res.on('close', () => {
+      clearInterval(keepAliveInterval);
       if (!res.writableEnded) {
         abortController.abort();
       }
@@ -164,7 +174,7 @@ export async function verifyPayloadsStreamHandler(req, res) {
       payloads: sanitizedPayloads,
       options: {
         rateLimitMs: Math.max(10, parseInt(options.rateLimitMs, 10) || 40),
-        timeoutMs: Math.max(1000, parseInt(options.timeoutMs, 10) || 4500),
+        timeoutMs: Math.max(1000, parseInt(options.timeoutMs, 10) || 8500),
         customHeaders: options.headers || {},
         abortSignal: abortController.signal,
         onProgress: (progressData) => {
@@ -173,6 +183,7 @@ export async function verifyPayloadsStreamHandler(req, res) {
       }
     });
 
+    clearInterval(keepAliveInterval);
     sendEvent('complete', {
       success: true,
       data: verificationResult
