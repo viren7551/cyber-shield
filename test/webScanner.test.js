@@ -26,6 +26,8 @@ import { generateJsonReport, generateMarkdownReport, generateHtmlReport } from '
 import { createMockLabServer } from '../src/modules/webScanner/testLab/mockVulnerableServer.js';
 import { runSecurityScan } from '../src/modules/webScanner/engine/scannerEngine.js';
 import { SecurityScanService } from '../src/modules/webScanner/webScanner.model.js';
+import { extractUrlParameters, inferParameterType, inferRiskVector, crawlFullWebsiteForParameters } from '../src/modules/webScanner/crawler/crawler.js';
+import { analyzeForms } from '../src/modules/webScanner/analyzers/formAnalyzer.js';
 
 describe('Web Security Scanner - Comprehensive Test Suite', () => {
 
@@ -535,6 +537,126 @@ describe('Web Security Scanner - Comprehensive Test Suite', () => {
       const verifyRes = await verifyXssFinding(storedFinding);
       assert.strictEqual(verifyRes.verified, true);
       assert.strictEqual(verifyRes.findingState, 'Needs Manual Verification');
+    });
+
+    it('should extract real form inputs and standalone inputs from HTML without phantom guesses', () => {
+      const sampleHtml = `
+        <html>
+          <body>
+            <header>
+              <!-- Standalone search input without form -->
+              <input type="search" name="site_search" placeholder="Search documentation...">
+            </header>
+            <main>
+              <form action="/contact-submit" method="POST">
+                <input type="text" name="full_name" placeholder="Your name">
+                <input type="email" name="user_email">
+                <textarea name="user_message"></textarea>
+                <input type="hidden" name="csrf_token" value="abc123token">
+              </form>
+            </main>
+          </body>
+        </html>
+      `;
+
+      const { forms, inputFields } = analyzeForms(sampleHtml, 'https://example.com/page');
+      assert.strictEqual(forms.length, 1);
+      assert.ok(inputFields.length >= 4);
+
+      // Verify standalone input was extracted
+      const standalone = inputFields.find(i => i.name === 'site_search');
+      assert.ok(standalone, 'Standalone search input must be extracted');
+      assert.strictEqual(standalone.type, 'search');
+      assert.strictEqual(standalone.isStandalone, true);
+      assert.ok(standalone.htmlSnippet.includes('site_search'));
+
+      // Build parameter inventory with real inputs
+      const inventory = buildParameterInventory([], forms, 'https://example.com', inputFields);
+      const allIndexedParams = inventory.flatMap(e => e.parameters);
+      const paramNames = allIndexedParams.map(p => p.name);
+
+      assert.ok(paramNames.includes('site_search'));
+      assert.ok(paramNames.includes('full_name'));
+      assert.ok(paramNames.includes('user_email'));
+      assert.ok(paramNames.includes('user_message'));
+
+      // Ensure NO phantom parameters are generated
+      assert.strictEqual(paramNames.includes('phantom_search'), false);
+
+      // Verify empty static page produces empty inventory (no guessing)
+      const emptyInventory = buildParameterInventory([{ url: 'https://example.com/static' }], [], 'https://example.com', []);
+      assert.strictEqual(emptyInventory.length, 0, 'Static page without inputs must not have guessed parameters');
+    });
+  });
+
+  // --------------------------------------------------------------------------
+  // 9. Parameterized URLs & Working Endpoints Verification
+  // --------------------------------------------------------------------------
+  describe('Parameterized URLs & Working Endpoints Engine', () => {
+    it('should correctly parse query parameters, infer types, and evaluate risk vectors', () => {
+      const url = 'https://example.com/products?id=102&category=electronics&redirect=https://target.com/callback&q=cyber';
+      const extracted = extractUrlParameters(url);
+
+      assert.strictEqual(extracted.hasParams, true);
+      assert.strictEqual(extracted.paramCount, 4);
+      assert.strictEqual(extracted.baseEndpoint, 'https://example.com/products');
+
+      const idParam = extracted.params.find(p => p.name === 'id');
+      assert.ok(idParam);
+      assert.strictEqual(idParam.type, 'Numeric ID');
+      assert.strictEqual(idParam.riskVector.vector, 'SQLi / IDOR');
+
+      const redirectParam = extracted.params.find(p => p.name === 'redirect');
+      assert.ok(redirectParam);
+      assert.strictEqual(redirectParam.type, 'Redirect URL');
+      assert.strictEqual(redirectParam.riskVector.vector, 'Open Redirect / SSRF');
+
+      const qParam = extracted.params.find(p => p.name === 'q');
+      assert.ok(qParam);
+      assert.strictEqual(qParam.type, 'Search Query');
+      assert.strictEqual(qParam.riskVector.vector, 'Reflected XSS / SQLi');
+    });
+
+    it('should filter working endpoints and exclude unreachable or error status codes', () => {
+      const sampleEndpoints = [
+        { url: 'https://example.com/home', statusCode: 200, isWorking: true },
+        { url: 'https://example.com/api/users', statusCode: 201, isWorking: true },
+        { url: 'https://example.com/redirect', statusCode: 302, isWorking: true },
+        { url: 'https://example.com/broken-page', statusCode: 404, isWorking: false },
+        { url: 'https://example.com/server-error', statusCode: 500, isWorking: false },
+        { url: 'https://example.com/unreachable', statusCode: 0, isWorking: false }
+      ];
+
+      const workingOnly = sampleEndpoints.filter(e => (e.statusCode >= 200 && e.statusCode < 400) || e.isWorking);
+      assert.strictEqual(workingOnly.length, 3);
+      assert.ok(!workingOnly.some(e => e.statusCode === 404));
+      assert.ok(!workingOnly.some(e => e.statusCode === 500));
+      assert.ok(!workingOnly.some(e => e.statusCode === 0));
+    });
+
+    it('should strictly exclude external URLs (such as youtu.be) from target scan endpoints', () => {
+      const targetOrigin = 'https://example.com';
+      const externalYoutubeUrl = 'https://youtu.be/g5A98Hx4BLQ?si=oW1lGy5IGp-QdvDL';
+      const inScopeUrl = 'https://example.com/search?q=cyber&sort=asc';
+
+      // 1. Scope boundary verification
+      assert.strictEqual(isUrlInScope(externalYoutubeUrl, targetOrigin, false), false);
+      assert.strictEqual(isUrlInScope(externalYoutubeUrl, targetOrigin, true), false);
+      assert.strictEqual(isUrlInScope(inScopeUrl, targetOrigin, false), true);
+
+      // 2. Endpoint list filtering
+      const mixedEndpoints = [
+        { url: inScopeUrl, statusCode: 200, isWorking: true },
+        { url: externalYoutubeUrl, statusCode: 200, isWorking: true },
+        { url: 'https://cdn.thirdparty.com/lib.js', statusCode: 200, isWorking: true },
+        { url: 'https://example.com/api/items?id=42', statusCode: 200, isWorking: true }
+      ];
+
+      const inScopeOnly = mixedEndpoints.filter(e => isUrlInScope(e.url, targetOrigin, false));
+      assert.strictEqual(inScopeOnly.length, 2);
+      assert.ok(!inScopeOnly.some(e => e.url.includes('youtu.be')));
+      assert.ok(!inScopeOnly.some(e => e.url.includes('thirdparty.com')));
+      assert.ok(inScopeOnly.every(e => e.url.startsWith('https://example.com')));
     });
   });
 

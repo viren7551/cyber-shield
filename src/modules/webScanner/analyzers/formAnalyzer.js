@@ -54,13 +54,16 @@ export function analyzeForms(html, pageUrl) {
     let csrfTokenName = null;
 
     while ((inputMatch = inputRegex.exec(formContent)) !== null) {
+      const fullInputTag = inputMatch[0];
       const attrs = inputMatch[1];
       const typeMatch = attrs.match(/type=["']([^"']*)["']/i);
       const nameMatch = attrs.match(/name=["']([^"']*)["']/i);
+      const idMatch = attrs.match(/id=["']([^"']*)["']/i);
       const valueMatch = attrs.match(/value=["']([^"']*)["']/i);
+      const placeholderMatch = attrs.match(/placeholder=["']([^"']*)["']/i);
 
       const type = typeMatch ? typeMatch[1].toLowerCase() : 'text';
-      const name = nameMatch ? nameMatch[1] : '';
+      const name = nameMatch ? nameMatch[1] : (idMatch ? idMatch[1] : '');
 
       if (type === 'password') {
         hasPasswordField = true;
@@ -75,36 +78,60 @@ export function analyzeForms(html, pageUrl) {
       inputs.push({
         name: name || `unnamed_input_${inputs.length + 1}`,
         type,
-        hasValue: !!valueMatch
+        hasValue: !!valueMatch,
+        placeholder: placeholderMatch ? placeholderMatch[1] : '',
+        id: idMatch ? idMatch[1] : '',
+        formAction: absoluteAction,
+        formMethod: method,
+        pageUrl,
+        htmlSnippet: fullInputTag
       });
     }
 
     // Parse textarea fields
-    const textareaRegex = /<textarea\b([^>]*)>/gi;
+    const textareaRegex = /<textarea\b([^>]*)>([\s\S]*?)<\/textarea>|<textarea\b([^>]*)>/gi;
     let textareaMatch;
     while ((textareaMatch = textareaRegex.exec(formContent)) !== null) {
-      const attrs = textareaMatch[1];
+      const fullTextareaTag = textareaMatch[0];
+      const attrs = textareaMatch[1] || textareaMatch[3] || '';
       const nameMatch = attrs.match(/name=["']([^"']*)["']/i);
-      if (nameMatch) {
+      const idMatch = attrs.match(/id=["']([^"']*)["']/i);
+      const placeholderMatch = attrs.match(/placeholder=["']([^"']*)["']/i);
+      const name = nameMatch ? nameMatch[1] : (idMatch ? idMatch[1] : '');
+      if (name) {
         inputs.push({
-          name: nameMatch[1],
+          name,
           type: 'textarea',
-          hasValue: false
+          hasValue: false,
+          placeholder: placeholderMatch ? placeholderMatch[1] : '',
+          id: idMatch ? idMatch[1] : '',
+          formAction: absoluteAction,
+          formMethod: method,
+          pageUrl,
+          htmlSnippet: fullTextareaTag
         });
       }
     }
 
     // Parse select fields
-    const selectRegex = /<select\b([^>]*)>/gi;
+    const selectRegex = /<select\b([^>]*)>[\s\S]*?<\/select>|<select\b([^>]*)>/gi;
     let selectMatch;
     while ((selectMatch = selectRegex.exec(formContent)) !== null) {
-      const attrs = selectMatch[1];
+      const fullSelectTag = selectMatch[0];
+      const attrs = selectMatch[1] || selectMatch[2] || '';
       const nameMatch = attrs.match(/name=["']([^"']*)["']/i);
-      if (nameMatch) {
+      const idMatch = attrs.match(/id=["']([^"']*)["']/i);
+      const name = nameMatch ? nameMatch[1] : (idMatch ? idMatch[1] : '');
+      if (name) {
         inputs.push({
-          name: nameMatch[1],
+          name,
           type: 'select',
-          hasValue: false
+          hasValue: false,
+          id: idMatch ? idMatch[1] : '',
+          formAction: absoluteAction,
+          formMethod: method,
+          pageUrl,
+          htmlSnippet: fullSelectTag
         });
       }
     }
@@ -116,13 +143,14 @@ export function analyzeForms(html, pageUrl) {
       id: `form_${formIndex}`,
       action: absoluteAction,
       rawAction,
+      pageUrl,
       method,
       inputsCount: inputs.length,
       hasPasswordField,
       hasCsrfToken,
       csrfTokenName,
       hasSubmitButton,
-      inputs: inputs.slice(0, 15) // limit for UI table
+      inputs: inputs.slice(0, 20)
     };
 
     forms.push(formData);
@@ -191,5 +219,78 @@ export function analyzeForms(html, pageUrl) {
     } catch {}
   }
 
-  return { forms, findings };
+  // Compile all input fields from forms
+  const allInputFields = [];
+  for (const f of forms) {
+    for (const inp of f.inputs || []) {
+      allInputFields.push({
+        ...inp,
+        source: 'Form Input Field',
+        formId: f.id,
+        formAction: f.action,
+        formMethod: f.method,
+        pageUrl
+      });
+    }
+  }
+
+  // Extract Standalone Input Fields (outside of <form> elements)
+  const htmlWithoutForms = html.replace(/<form\b[\s\S]*?<\/form>/gi, '');
+  const standaloneInputRegex = /<input\b([^>]*)>/gi;
+  let saMatch;
+  while ((saMatch = standaloneInputRegex.exec(htmlWithoutForms)) !== null) {
+    const fullTag = saMatch[0];
+    const attrs = saMatch[1];
+    const typeMatch = attrs.match(/type=["']([^"']*)["']/i);
+    const nameMatch = attrs.match(/name=["']([^"']*)["']/i);
+    const idMatch = attrs.match(/id=["']([^"']*)["']/i);
+    const placeholderMatch = attrs.match(/placeholder=["']([^"']*)["']/i);
+
+    const type = typeMatch ? typeMatch[1].toLowerCase() : 'text';
+    const name = nameMatch ? nameMatch[1] : (idMatch ? idMatch[1] : '');
+
+    // Skip buttons and submit inputs
+    if (type === 'submit' || type === 'button' || type === 'image') continue;
+    if (!name) continue;
+
+    allInputFields.push({
+      name,
+      type,
+      placeholder: placeholderMatch ? placeholderMatch[1] : '',
+      id: idMatch ? idMatch[1] : '',
+      formAction: pageUrl,
+      formMethod: 'GET',
+      pageUrl,
+      htmlSnippet: fullTag,
+      source: 'Standalone Input Field',
+      isStandalone: true
+    });
+  }
+
+  // Standalone textareas
+  const standaloneTextareaRegex = /<textarea\b([^>]*)>([\s\S]*?)<\/textarea>|<textarea\b([^>]*)>/gi;
+  while ((saMatch = standaloneTextareaRegex.exec(htmlWithoutForms)) !== null) {
+    const fullTag = saMatch[0];
+    const attrs = saMatch[1] || saMatch[3] || '';
+    const nameMatch = attrs.match(/name=["']([^"']*)["']/i);
+    const idMatch = attrs.match(/id=["']([^"']*)["']/i);
+    const placeholderMatch = attrs.match(/placeholder=["']([^"']*)["']/i);
+    const name = nameMatch ? nameMatch[1] : (idMatch ? idMatch[1] : '');
+    if (name) {
+      allInputFields.push({
+        name,
+        type: 'textarea',
+        placeholder: placeholderMatch ? placeholderMatch[1] : '',
+        id: idMatch ? idMatch[1] : '',
+        formAction: pageUrl,
+        formMethod: 'GET',
+        pageUrl,
+        htmlSnippet: fullTag,
+        source: 'Standalone Input Field',
+        isStandalone: true
+      });
+    }
+  }
+
+  return { forms, findings, inputFields: allInputFields };
 }

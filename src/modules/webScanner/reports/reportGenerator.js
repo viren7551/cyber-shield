@@ -45,7 +45,8 @@ export function generateJsonReport(scan, findings = [], endpoints = []) {
       tls: scan.targetInfo?.tls || null,
       headers: scan.targetInfo?.headerAudit || null,
       cookies: scan.targetInfo?.cookies || [],
-      endpoints: endpoints.slice(0, 50)
+      workingEndpoints: endpoints.filter(e => (e.statusCode >= 200 && e.statusCode < 400) || e.isWorking).slice(0, 50),
+      parameterizedUrls: (scan.targetInfo?.parameterizedUrls || endpoints.filter(e => e.isParameterized || (e.url && e.url.includes('?')))).slice(0, 50)
     }
   };
 }
@@ -56,6 +57,8 @@ export function generateJsonReport(scan, findings = [], endpoints = []) {
 export function generateMarkdownReport(scan, findings = [], endpoints = []) {
   const stats = scan.statistics || {};
   const counts = stats.counts || {};
+  const workingEndpoints = endpoints.filter(e => (e.statusCode >= 200 && e.statusCode < 400) || e.isWorking);
+  const parameterizedUrls = scan.targetInfo?.parameterizedUrls || endpoints.filter(e => e.isParameterized || (e.url && e.url.includes('?')));
 
   let md = `# CyberShield Web Security Audit Report\n\n`;
   md += `**Target URL:** ${scan.target}  \n`;
@@ -113,10 +116,25 @@ export function generateMarkdownReport(scan, findings = [], endpoints = []) {
   }
   md += `\n`;
 
-  md += `## 4. Appendix: Discovered Scope Endpoints (${endpoints.length})\n\n`;
-  endpoints.slice(0, 30).forEach(e => {
-    md += `- \`${e.url}\` [Status: ${e.statusCode || '200'} | Type: ${e.type || 'Page'}]\n`;
-  });
+  md += `## 4. Appendix: Verified Working Endpoints (${workingEndpoints.length})\n\n`;
+  if (workingEndpoints.length === 0) {
+    md += `*No reachable working endpoints verified.*\n\n`;
+  } else {
+    workingEndpoints.slice(0, 30).forEach(e => {
+      md += `- \`${e.url}\` [Status: ${e.statusCode || '200 OK'} | Type: ${e.type || 'Page'}]\n`;
+    });
+  }
+  md += `\n`;
+
+  md += `## 5. Appendix: Discovered Parameterized URLs & Attack Surfaces (${parameterizedUrls.length})\n\n`;
+  if (parameterizedUrls.length === 0) {
+    md += `*No parameterized URLs found on target.*\n\n`;
+  } else {
+    parameterizedUrls.slice(0, 30).forEach(p => {
+      const pNames = (p.parameters || []).map(param => param.name).join(', ') || p.paramNames?.join(', ') || 'N/A';
+      md += `- \`${p.url}\` [Params: ${pNames} | Method: ${p.method || 'GET'} | Status: ${p.statusCode || 200}]\n`;
+    });
+  }
 
   return md;
 }
@@ -128,6 +146,8 @@ export function generateHtmlReport(scan, findings = [], endpoints = []) {
   const stats = scan.statistics || {};
   const counts = stats.counts || {};
   const techs = scan.targetInfo?.technologies || [];
+  const workingEndpoints = endpoints.filter(e => (e.statusCode >= 200 && e.statusCode < 400) || e.isWorking);
+  const parameterizedUrls = scan.targetInfo?.parameterizedUrls || endpoints.filter(e => e.isParameterized || (e.url && e.url.includes('?')));
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -218,11 +238,26 @@ export function generateHtmlReport(scan, findings = [], endpoints = []) {
     </tbody>
   </table>
 
-  <h2>Appendix: Discovered Scope Endpoints (${endpoints.length})</h2>
+  <h2>Appendix: Verified Working Scope Endpoints (${workingEndpoints.length})</h2>
   <table>
     <thead><tr><th>URL</th><th>Type</th><th>Status Code</th><th>Depth</th></tr></thead>
     <tbody>
-      ${endpoints.slice(0, 30).map(e => `<tr><td><code>${e.url}</code></td><td>${e.type || 'Page'}</td><td>${e.statusCode || '200'}</td><td>${e.depth || 0}</td></tr>`).join('')}
+      ${workingEndpoints.length > 0
+        ? workingEndpoints.slice(0, 30).map(e => `<tr><td><code>${e.url}</code></td><td>${e.type || 'Page'}</td><td>${e.statusCode || '200'}</td><td>${e.depth || 0}</td></tr>`).join('')
+        : '<tr><td colspan="4">No verified working endpoints</td></tr>'}
+    </tbody>
+  </table>
+
+  <h2>Appendix: Discovered Parameterized URLs & Attack Surfaces (${parameterizedUrls.length})</h2>
+  <table>
+    <thead><tr><th>Parameterized URL</th><th>Parameters</th><th>Method</th><th>Status</th></tr></thead>
+    <tbody>
+      ${parameterizedUrls.length > 0
+        ? parameterizedUrls.slice(0, 30).map(p => {
+            const pNames = (p.parameters || []).map(param => param.name).join(', ') || p.paramNames?.join(', ') || 'N/A';
+            return `<tr><td><code>${p.url}</code></td><td><strong>${pNames}</strong></td><td>${p.method || 'GET'}</td><td>${p.statusCode || 200}</td></tr>`;
+          }).join('')
+        : '<tr><td colspan="4">No parameterized URLs discovered</td></tr>'}
     </tbody>
   </table>
 </body>

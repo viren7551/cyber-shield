@@ -296,6 +296,7 @@ export async function runSecurityScan(scanParams, scanId) {
 
     discoveredEndpoints = crawlResult.discoveredEndpoints || [];
     discoveredForms = crawlResult.discoveredForms || [];
+    const discoveredInputFields = crawlResult.discoveredInputFields || [];
 
     if (crawlResult.findings?.length) {
       rawFindings.push(...crawlResult.findings);
@@ -321,22 +322,6 @@ export async function runSecurityScan(scanParams, scanId) {
     }
 
     if (abortController.signal.aborted) throw new Error('Scan cancelled by user.');
-
-    // -------------------------------------------------------------
-    // Phase 8.5: Reflected XSS & Input Reflection Audit (90%)
-    // -------------------------------------------------------------
-    updateProgress('Auditing parameter reflections & XSS injection vectors', 'XSS Analyzer', 90);
-
-    const xssFindings = await analyzeReflectedXss(discoveredEndpoints, {
-      targetUrl: normalizedTarget,
-      forms: discoveredForms,
-      userAgent,
-      timeoutMs,
-      abortSignal: abortController.signal
-    });
-    if (xssFindings?.length) {
-      rawFindings.push(...xssFindings);
-    }
 
     // -------------------------------------------------------------
     // Phase 9: Finding Deduplication & Risk Scoring (95%)
@@ -387,12 +372,19 @@ export async function runSecurityScan(scanParams, scanId) {
         redirects: redirectAnalysis?.chain || [],
         totalPagesCrawled: crawlResult.totalPagesScanned,
         totalEndpointsDiscovered: discoveredEndpoints.length,
-        visitableEndpointsCount: discoveredEndpoints.filter(e => e.statusCode === 200 || e.isVisitable).length,
+        workingEndpointsCount: discoveredEndpoints.filter(e => e.isWorking || (e.statusCode >= 200 && e.statusCode < 400)).length,
+        visitableEndpointsCount: discoveredEndpoints.filter(e => e.isWorking || (e.statusCode >= 200 && e.statusCode < 400)).length,
         totalFormsDiscovered: discoveredForms.length,
-        parameterInventory: buildParameterInventory(discoveredEndpoints, discoveredForms, normalizedTarget)
+        forms: discoveredForms,
+        inputFields: discoveredInputFields,
+        totalInputFieldsDiscovered: discoveredInputFields.length,
+        parameterizedUrls: crawlResult.parameterizedUrls || [],
+        totalParameterizedUrls: (crawlResult.parameterizedUrls || []).length,
+        parameterInventory: buildParameterInventory(discoveredEndpoints, discoveredForms, normalizedTarget, discoveredInputFields)
       },
       findings: sanitizedFindings,
-      endpoints: discoveredEndpoints
+      endpoints: discoveredEndpoints,
+      parameterizedUrls: crawlResult.parameterizedUrls || []
     };
 
     emitScanProgress(scanId, {

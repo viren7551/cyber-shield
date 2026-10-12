@@ -23,6 +23,7 @@ export async function runFullXssAudit(endpoints = [], options = {}) {
   const {
     targetUrl = '',
     forms = [],
+    inputFields = [],
     userAgent,
     timeoutMs = 4500,
     rateLimitMs = 100,
@@ -34,8 +35,8 @@ export async function runFullXssAudit(endpoints = [], options = {}) {
     targetOrigin = new URL(targetUrl).origin;
   } catch {}
 
-  // 1. Build normalized parameter inventory
-  const parameterInventory = buildParameterInventory(endpoints, forms, targetUrl);
+  // 1. Build normalized parameter inventory from verified endpoints, forms, and input fields
+  const parameterInventory = buildParameterInventory(endpoints, forms, targetUrl, inputFields);
 
   const allXssFindings = [];
 

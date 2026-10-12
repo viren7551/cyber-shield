@@ -36,10 +36,10 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
     if (abortSignal && abortSignal.aborted) break;
 
     const endpointUrl = entry.endpoint;
-    const method = entry.method || 'GET';
+    const method = (entry.method || 'GET').toUpperCase();
 
-    // Only audit GET query reflection automatically
-    if (method !== 'GET') continue;
+    // Support both GET query inputs and POST form inputs
+    if (method !== 'GET' && method !== 'POST') continue;
 
     for (const param of entry.parameters) {
       if (probesExecuted >= maxProbes) break;
@@ -48,9 +48,21 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
       const paramName = param.name;
       if (!paramName || param.isCsrf) continue;
 
-      const dedupeKey = `${endpointUrl}?${paramName}`;
+      const dedupeKey = `${method}:${endpointUrl}?${paramName}`;
       if (probedKeySet.has(dedupeKey)) continue;
       probedKeySet.add(dedupeKey);
+
+      const isInput = !!(param.isInputField || param.source?.includes('Input') || param.source?.includes('Form'));
+      const inputFieldData = {
+        name: paramName,
+        type: param.type || 'text',
+        source: param.source || (isInput ? 'HTML Input Field' : 'URL Query Parameter'),
+        pageUrl: param.pageUrl || endpointUrl,
+        formAction: param.formAction || endpointUrl,
+        formMethod: method,
+        placeholder: param.placeholder || '',
+        htmlSnippet: param.htmlSnippet || `<input type="${param.type || 'text'}" name="${paramName}">`
+      };
 
       // =====================================================================
       // STAGE 1: DISCOVERY & CANARY REFLECTION CHECK (Alphanumeric Token Only)
@@ -58,13 +70,27 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
       const uniqueId = Math.random().toString(36).substring(2, 8);
       const canaryToken = `${MARKER_PREFIX}${uniqueId}`;
 
-      let canaryUrl;
-      try {
-        const u = new URL(entry.fullUrl || endpointUrl);
-        u.searchParams.set(paramName, canaryToken);
-        canaryUrl = u.toString();
-      } catch {
-        continue;
+      let canaryUrl = entry.fullUrl || endpointUrl;
+      const requestOptions1 = {
+        method,
+        timeoutMs: Math.min(4500, timeoutMs),
+        userAgent,
+        abortSignal
+      };
+
+      if (method === 'GET') {
+        try {
+          const u = new URL(entry.fullUrl || endpointUrl);
+          u.searchParams.set(paramName, canaryToken);
+          canaryUrl = u.toString();
+        } catch {
+          continue;
+        }
+      } else {
+        requestOptions1.headers = {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        };
+        requestOptions1.body = `${encodeURIComponent(paramName)}=${encodeURIComponent(canaryToken)}`;
       }
 
       probesExecuted++;
@@ -74,13 +100,7 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
 
       let initialBody = null;
       try {
-        const res1 = await safeRequest(canaryUrl, {
-          method: 'GET',
-          timeoutMs: Math.min(4500, timeoutMs),
-          userAgent,
-          abortSignal
-        });
-
+        const res1 = await safeRequest(canaryUrl, requestOptions1);
         if (!res1.success || !res1.body || typeof res1.body !== 'string') {
           continue;
         }
@@ -99,18 +119,31 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
       // =====================================================================
       // STAGE 2: CONTEXT ANALYSIS & SYNTAX ALTERATION / ENCODING PROBE
       // =====================================================================
-      // Input was reflected! Now test whether dangerous syntax can alter parser context.
       const syntaxId = Math.random().toString(36).substring(2, 8);
       const syntaxCanary = `${MARKER_PREFIX}${syntaxId}`;
       const syntaxPayload = `${syntaxCanary}${DELIMITER_PROBE}`;
 
-      let syntaxUrl;
-      try {
-        const u2 = new URL(entry.fullUrl || endpointUrl);
-        u2.searchParams.set(paramName, syntaxPayload);
-        syntaxUrl = u2.toString();
-      } catch {
-        continue;
+      let syntaxUrl = entry.fullUrl || endpointUrl;
+      const requestOptions2 = {
+        method,
+        timeoutMs: Math.min(4500, timeoutMs),
+        userAgent,
+        abortSignal
+      };
+
+      if (method === 'GET') {
+        try {
+          const u2 = new URL(entry.fullUrl || endpointUrl);
+          u2.searchParams.set(paramName, syntaxPayload);
+          syntaxUrl = u2.toString();
+        } catch {
+          continue;
+        }
+      } else {
+        requestOptions2.headers = {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        };
+        requestOptions2.body = `${encodeURIComponent(paramName)}=${encodeURIComponent(syntaxPayload)}`;
       }
 
       probesExecuted++;
@@ -120,13 +153,7 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
 
       let syntaxBody = null;
       try {
-        const res2 = await safeRequest(syntaxUrl, {
-          method: 'GET',
-          timeoutMs: Math.min(4500, timeoutMs),
-          userAgent,
-          abortSignal
-        });
-
+        const res2 = await safeRequest(syntaxUrl, requestOptions2);
         if (res2.success && res2.body && typeof res2.body === 'string') {
           syntaxBody = res2.body;
         }
@@ -175,12 +202,16 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
         encodingRes.encoding === 'HTML_ENTITIES' ||
         (encodingRes.encodedChars.length >= 2 && encodingRes.unencodedChars.length === 0)
       ) {
-        const reasoning = 'The parameter was reflected, but special characters were HTML encoded. No XSS vulnerability was established.';
+        const reasoning = isInput
+          ? `The input field "${paramName}" (<${param.type || 'text'}>) was reflected, but special characters were HTML encoded. No XSS vulnerability was established.`
+          : 'The parameter was reflected, but special characters were HTML encoded. No XSS vulnerability was established.';
 
         findings.push({
           id: `refl_${Math.random().toString(36).substring(2, 9)}`,
           ruleId: 'INPUT_REFLECTION_SAFE_ENCODING',
-          title: `Input Reflection (Safely Encoded) on Parameter "${paramName}"`,
+          title: isInput
+            ? `Input Reflection (Safely Encoded) on Input Field "${paramName}"`
+            : `Input Reflection (Safely Encoded) on Parameter "${paramName}"`,
           category: 'Input Reflection',
           type: 'reflection',
           severity: 'Informational',
@@ -195,14 +226,15 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
           encoding: 'HTML_ENTITIES',
           source: paramName,
           sink: null,
-          url: `${endpointUrl}?${paramName}=`,
-          affectedUrls: [`${endpointUrl}?${paramName}=`],
+          url: method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl,
+          affectedUrls: [method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl],
           parameter: paramName,
-          method: 'GET',
+          method,
           occurrences: contextRes.occurrences,
           reasoning,
           description: reasoning,
           impact: 'Informational finding: No exploitable cross-site scripting exists. The server safely neutralized HTML metacharacters with standard entity encoding.',
+          inputField: isInput ? inputFieldData : null,
           evidence: {
             injectionValue: probeUsed,
             returnedValue: markerUsed + encodingRes.encodedChars.join(''),
@@ -211,11 +243,16 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
             contextAfter: contextRes.contextAfter,
             encodingTransformations: encodingRes.transformations,
             detectionReasoning: reasoning,
-            vulnerableEndpoint: `${endpointUrl}?${paramName}=`,
+            vulnerableEndpoint: method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl,
             vulnerableParameter: paramName,
             detectedContext: contextRes.context,
             encodingStatus: 'Safe HTML Entity Encoded',
-            reproducibleUrl: syntaxUrl || canaryUrl
+            reproducibleUrl: syntaxUrl || canaryUrl,
+            inputField: isInput ? inputFieldData : null,
+            foundOnPage: inputFieldData.pageUrl,
+            formAction: inputFieldData.formAction,
+            htmlSnippet: inputFieldData.htmlSnippet,
+            isInputField: isInput
           },
           remediation: 'Maintain current output encoding practices.',
           cwe: 'CWE-79',
@@ -227,7 +264,7 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
       }
 
       // ---------------------------------------------------------------------
-      // CASE D: Strong evidence showing unencoded input in an interpretable context altering parsing context
+      // CASE D: Strong evidence showing unencoded input altering parsing context
       // (HIGH_CONFIDENCE_XSS)
       // ---------------------------------------------------------------------
       else if (
@@ -240,12 +277,16 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
           contextRes.context === XSS_CONTEXTS.JAVASCRIPT_CODE ||
           contextRes.context === XSS_CONTEXTS.SCRIPT_CONTEXT)
       ) {
-        const reasoning = `Attacker-controlled input was reflected into a browser-executable context (${contextRes.context}) without adequate output encoding. Injected syntax (${encodingRes.unencodedChars.join(', ')}) was returned unescaped, allowing alteration of the browser parsing context.`;
+        const reasoning = isInput
+          ? `Attacker-controlled input submitted via input field "${paramName}" (<${param.type || 'text'}>) on page "${inputFieldData.pageUrl}" was reflected into a browser-executable context (${contextRes.context}) without adequate output encoding. Injected syntax (${encodingRes.unencodedChars.join(', ')}) was returned unescaped, allowing alteration of the browser parsing context.`
+          : `Attacker-controlled input was reflected into a browser-executable context (${contextRes.context}) without adequate output encoding. Injected syntax (${encodingRes.unencodedChars.join(', ')}) was returned unescaped, allowing alteration of the browser parsing context.`;
 
         findings.push({
           id: `xss_${Math.random().toString(36).substring(2, 9)}`,
           ruleId: 'REFLECTED_XSS_HIGH_CONFIDENCE',
-          title: `High Confidence Potential XSS on Parameter "${paramName}" (${contextRes.context})`,
+          title: isInput
+            ? `High Confidence Potential XSS on Input Field "${paramName}" (<${param.type || 'text'}>) (${contextRes.context})`
+            : `High Confidence Potential XSS on Parameter "${paramName}" (${contextRes.context})`,
           category: 'Cross-Site Scripting',
           type: 'reflected',
           severity: 'High',
@@ -260,14 +301,17 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
           encoding: 'NONE',
           source: paramName,
           sink: null,
-          url: `${endpointUrl}?${paramName}=`,
-          affectedUrls: [`${endpointUrl}?${paramName}=`],
+          url: method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl,
+          affectedUrls: [method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl],
           parameter: paramName,
-          method: 'GET',
+          method,
           occurrences: contextRes.occurrences,
           reasoning,
-          description: `The parameter "${paramName}" reflects user-supplied data into ${contextRes.context} without appropriate output encoding. ${alterability.explanation}`,
-          impact: 'An attacker can supply malicious JavaScript via a link. When a victim loads the link, script executes in their authenticated browser session, allowing cookie theft, credential harvesting, or DOM manipulation.',
+          description: isInput
+            ? `The input field <${param.type || 'text'} name="${paramName}"> discovered on page "${inputFieldData.pageUrl}" reflects user-supplied data into ${contextRes.context} without appropriate output encoding. ${alterability.explanation}`
+            : `The parameter "${paramName}" reflects user-supplied data into ${contextRes.context} without appropriate output encoding. ${alterability.explanation}`,
+          impact: 'An attacker can supply malicious JavaScript via a link or form input. When a victim loads the payload, script executes in their browser session, allowing cookie theft, credential harvesting, or DOM manipulation.',
+          inputField: isInput ? inputFieldData : null,
           evidence: {
             injectionValue: probeUsed,
             returnedValue: markerUsed + encodingRes.unencodedChars.join(''),
@@ -276,16 +320,21 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
             contextAfter: contextRes.contextAfter,
             encodingTransformations: encodingRes.transformations,
             detectionReasoning: reasoning,
-            vulnerableEndpoint: `${endpointUrl}?${paramName}=`,
+            vulnerableEndpoint: method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl,
             vulnerableParameter: paramName,
             detectedContext: contextRes.context,
             encodingStatus: 'Unencoded (Raw Delimiters Reflected)',
             unencodedMetas: encodingRes.unencodedChars.join(', '),
-            reproducibleUrl: syntaxUrl || canaryUrl
+            reproducibleUrl: syntaxUrl || canaryUrl,
+            inputField: isInput ? inputFieldData : null,
+            foundOnPage: inputFieldData.pageUrl,
+            formAction: inputFieldData.formAction,
+            htmlSnippet: inputFieldData.htmlSnippet,
+            isInputField: isInput
           },
           remediation: `Apply context-aware output encoding to "${paramName}" before rendering it into the HTML document:
-1. In PHP: htmlspecialchars($_GET['${paramName}'] ?? '', ENT_QUOTES, 'UTF-8')
-2. In Node.js / Express: validator.escape(req.query.${paramName} || '')
+1. In PHP: htmlspecialchars($_${method}['${paramName}'] ?? '', ENT_QUOTES, 'UTF-8')
+2. In Node.js / Express: validator.escape(req.${method === 'POST' ? 'body' : 'query'}.${paramName} || '')
 3. In Python (Flask/Django): Ensure auto-escaping is active; do not use |safe
 4. Deploy a strict Content Security Policy (CSP) with script-src 'self'.`,
           cwe: 'CWE-79',
@@ -306,12 +355,16 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
         contextRes.context === XSS_CONTEXTS.HTML_COMMENT ||
         (alterability.canAlter && encodingRes.status === ENCODING_STATUS.CANARY_ONLY)
       ) {
-        const reasoning = 'The parameter was reflected into an HTML/attribute/script context and the scanner observed insufficient output encoding. Manual verification is recommended.';
+        const reasoning = isInput
+          ? `The input field "${paramName}" (<${param.type || 'text'}>) on page "${inputFieldData.pageUrl}" was reflected into an HTML/attribute/script context and the scanner observed insufficient output encoding. Manual verification is recommended.`
+          : 'The parameter was reflected into an HTML/attribute/script context and the scanner observed insufficient output encoding. Manual verification is recommended.';
 
         findings.push({
           id: `xss_${Math.random().toString(36).substring(2, 9)}`,
           ruleId: 'REFLECTED_XSS_POTENTIAL',
-          title: `Potential Reflected XSS on Parameter "${paramName}" (${contextRes.context})`,
+          title: isInput
+            ? `Potential Reflected XSS on Input Field "${paramName}" (<${param.type || 'text'}>) (${contextRes.context})`
+            : `Potential Reflected XSS on Parameter "${paramName}" (${contextRes.context})`,
           category: 'Cross-Site Scripting',
           type: 'reflected',
           severity: 'Medium',
@@ -326,14 +379,17 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
           encoding: encodingRes.encoding || 'PARTIAL',
           source: paramName,
           sink: null,
-          url: `${endpointUrl}?${paramName}=`,
-          affectedUrls: [`${endpointUrl}?${paramName}=`],
+          url: method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl,
+          affectedUrls: [method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl],
           parameter: paramName,
-          method: 'GET',
+          method,
           occurrences: contextRes.occurrences,
           reasoning,
-          description: `The parameter "${paramName}" reflects user input into ${contextRes.context}. Partial encoding or boundary constraints were observed. ${alterability.explanation}`,
+          description: isInput
+            ? `The input field <${param.type || 'text'} name="${paramName}"> on page "${inputFieldData.pageUrl}" reflects user input into ${contextRes.context}. Partial encoding or boundary constraints were observed. ${alterability.explanation}`
+            : `The parameter "${paramName}" reflects user input into ${contextRes.context}. Partial encoding or boundary constraints were observed. ${alterability.explanation}`,
           impact: 'Depending on application filtering and surrounding HTML structure, partial encoding may allow context breakouts.',
+          inputField: isInput ? inputFieldData : null,
           evidence: {
             injectionValue: probeUsed,
             returnedValue: markerUsed + (encodingRes.unencodedChars.join('') || ''),
@@ -342,12 +398,17 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
             contextAfter: contextRes.contextAfter,
             encodingTransformations: encodingRes.transformations,
             detectionReasoning: reasoning,
-            vulnerableEndpoint: `${endpointUrl}?${paramName}=`,
+            vulnerableEndpoint: method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl,
             vulnerableParameter: paramName,
             detectedContext: contextRes.context,
             encodingStatus: encodingRes.status,
             unencodedMetas: encodingRes.unencodedChars.join(', '),
-            reproducibleUrl: syntaxUrl || canaryUrl
+            reproducibleUrl: syntaxUrl || canaryUrl,
+            inputField: isInput ? inputFieldData : null,
+            foundOnPage: inputFieldData.pageUrl,
+            formAction: inputFieldData.formAction,
+            htmlSnippet: inputFieldData.htmlSnippet,
+            isInputField: isInput
           },
           remediation: 'Ensure universal context-aware HTML entity encoding is applied to all metacharacters (<, >, ", \', &).',
           cwe: 'CWE-79',
@@ -360,12 +421,16 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
       // CASE B2: Reflection Only (REFLECTION_ONLY) - NEVER XSS!
       // ---------------------------------------------------------------------
       else {
-        const reasoning = 'The parameter value was reflected in the HTTP response. The observed reflection alone does not establish cross-site scripting because the scanner did not establish an executable browser context.';
+        const reasoning = isInput
+          ? `The input field "${paramName}" (<${param.type || 'text'}>) value was reflected in the HTTP response. The observed reflection alone does not establish cross-site scripting because the scanner did not establish an executable browser context.`
+          : 'The parameter value was reflected in the HTTP response. The observed reflection alone does not establish cross-site scripting because the scanner did not establish an executable browser context.';
 
         findings.push({
           id: `refl_${Math.random().toString(36).substring(2, 9)}`,
           ruleId: 'INPUT_REFLECTION_ONLY',
-          title: `Input Reflection in ${contextRes.context} on Parameter "${paramName}"`,
+          title: isInput
+            ? `Input Reflection in ${contextRes.context} on Input Field "${paramName}"`
+            : `Input Reflection in ${contextRes.context} on Parameter "${paramName}"`,
           category: 'Input Reflection',
           type: 'reflection',
           severity: 'Informational',
@@ -380,14 +445,15 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
           encoding: encodingRes.encoding || 'NONE',
           source: paramName,
           sink: null,
-          url: `${endpointUrl}?${paramName}=`,
-          affectedUrls: [`${endpointUrl}?${paramName}=`],
+          url: method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl,
+          affectedUrls: [method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl],
           parameter: paramName,
-          method: 'GET',
+          method,
           occurrences: contextRes.occurrences,
           reasoning,
           description: reasoning,
           impact: 'Informational finding: User input is reflected in the HTTP response body. This proves input reflection only and is NOT an XSS vulnerability.',
+          inputField: isInput ? inputFieldData : null,
           evidence: {
             injectionValue: probeUsed,
             returnedValue: markerUsed,
@@ -396,11 +462,16 @@ export async function auditReflectedXss(parameterInventory = [], options = {}) {
             contextAfter: contextRes.contextAfter,
             encodingTransformations: encodingRes.transformations,
             detectionReasoning: reasoning,
-            vulnerableEndpoint: `${endpointUrl}?${paramName}=`,
+            vulnerableEndpoint: method === 'GET' ? `${endpointUrl}?${paramName}=` : endpointUrl,
             vulnerableParameter: paramName,
             detectedContext: contextRes.context,
             encodingStatus: encodingRes.status,
-            reproducibleUrl: canaryUrl
+            reproducibleUrl: canaryUrl,
+            inputField: isInput ? inputFieldData : null,
+            foundOnPage: inputFieldData.pageUrl,
+            formAction: inputFieldData.formAction,
+            htmlSnippet: inputFieldData.htmlSnippet,
+            isInputField: isInput
           },
           remediation: 'Ensure context-appropriate encoding is maintained if this field is ever rendered in active contexts.',
           cwe: 'CWE-79',

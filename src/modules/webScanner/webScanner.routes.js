@@ -13,6 +13,7 @@ import {
   subscribeScanEventsHandler,
   getPresetsHandler,
   probeEndpointsHandler,
+  crawlParameterizedUrlsHandler,
   auditXssHandler,
   verifyXssFindingHandler,
   getParameterInventoryHandler
@@ -45,6 +46,8 @@ router.get('/:id/findings', getFindingsHandler);
 router.patch('/:id/findings/:findingId', updateFindingStatusHandler);
 router.get('/:id/endpoints', getEndpointsHandler);
 router.post('/:id/endpoints/probe', probeEndpointsHandler);
+router.post('/:id/endpoints/crawl-parameterized', crawlParameterizedUrlsHandler);
+router.post('/:id/crawl-parameters', crawlParameterizedUrlsHandler);
 router.get('/:id/technologies', getTechnologiesHandler);
 router.post('/:id/xss/audit', auditXssHandler);
 router.post('/:id/xss/verify', verifyXssFindingHandler);

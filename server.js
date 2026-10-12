@@ -37,7 +37,7 @@ app.get('/api/health', (req, res) => {
     status: 'ONLINE',
     project: 'CyberShield',
     port: PORT,
-    activeModules: ['steganography', 'password-audit', 'metadata-sanitizer', 'osint', 'network-scanner', 'log-analyzer', 'url-analyzer', 'web-security-scanner'],
+    activeModules: ['steganography', 'password-audit', 'metadata-sanitizer', 'osint', 'network-scanner', 'log-analyzer', 'url-analyzer', 'web-security-scanner', 'xss-verifier'],
     database: dbStatus,
     timestamp: new Date()
   });

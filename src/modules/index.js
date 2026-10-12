@@ -7,6 +7,7 @@ import scannerRoutes from './networkScanner/scanner.routes.js';
 import logAnalyzerRoutes from './logAnalyzer/logAnalyzer.routes.js';
 import urlAnalyzerRoutes from './urlAnalyzer/urlAnalyzer.routes.js';
 import webScannerRoutes from './webScanner/webScanner.routes.js';
+import xssVerifierRoutes from './xssVerifier/xssVerifier.routes.js';
 
 const router = express.Router();
 
@@ -23,6 +24,7 @@ router.use('/log-analyzer', logAnalyzerRoutes);
 router.use('/url-analyzer', urlAnalyzerRoutes);
 router.use('/security-scans', webScannerRoutes);
 router.use('/web-scanner', webScannerRoutes);
+router.use('/xss-verifier', xssVerifierRoutes);
 
 export default router;
 

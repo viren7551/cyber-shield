@@ -5,13 +5,16 @@
  */
 
 /**
- * Build a normalized parameter inventory from crawled endpoints and forms.
+ * Build a normalized parameter inventory from crawled endpoints, forms, and input fields.
+ * Strictly tests real input fields and authentic parameterized URLs.
+ * Never guesses phantom parameters on static pages without input fields.
  * @param {Array<object>} endpoints - Discovered in-scope endpoints from crawler
  * @param {Array<object>} forms - Discovered forms from form analyzer
  * @param {string} targetUrl - Root target application URL
+ * @param {Array<object>} inputFields - Discovered input fields from pages
  * @returns {Array<object>} - Normalized parameter inventory entries
  */
-export function buildParameterInventory(endpoints = [], forms = [], targetUrl = '') {
+export function buildParameterInventory(endpoints = [], forms = [], targetUrl = '', inputFields = []) {
   const inventoryMap = new Map(); // key: `${method}:${endpointUrl}` -> inventoryEntry
 
   // Helper to get or create entry
@@ -37,7 +40,7 @@ export function buildParameterInventory(endpoints = [], forms = [], targetUrl = 
     return inventoryMap.get(key);
   }
 
-  // 1. Extract from crawled endpoints with query strings
+  // 1. Extract from crawled endpoints with real query strings
   for (const ep of endpoints) {
     if (!ep || !ep.url) continue;
     try {
@@ -52,7 +55,10 @@ export function buildParameterInventory(endpoints = [], forms = [], targetUrl = 
               type: 'query',
               location: 'Query String',
               sampleValue: parsed.searchParams.get(key) || '',
-              source: 'URL Query'
+              source: 'URL Query',
+              targetEndpoint: ep.url,
+              pageUrl: ep.url,
+              isInputField: false
             });
           }
         }
@@ -79,35 +85,46 @@ export function buildParameterInventory(endpoints = [], forms = [], targetUrl = 
           type: input.type || 'text',
           location: method === 'GET' ? 'Query String' : 'Request Body',
           sampleValue: '',
-          source: input.type === 'textarea' ? 'Form Textarea' : input.type === 'select' ? 'Form Select' : 'Form Input',
-          isCsrf
+          source: input.type === 'textarea' ? 'Form Textarea' : input.type === 'select' ? 'Form Select' : 'Form Input Field',
+          isCsrf,
+          isInputField: true,
+          pageUrl: form.pageUrl || input.pageUrl || targetUrl,
+          formAction: actionUrl,
+          formMethod: method,
+          placeholder: input.placeholder || '',
+          htmlSnippet: input.htmlSnippet || `<input type="${input.type || 'text'}" name="${input.name}">`
         });
       }
     }
   }
 
-  // 3. Ensure root URL and common search pages have candidate reflection parameters
-  const rootTargets = [];
-  if (targetUrl) rootTargets.push(targetUrl);
-  for (const ep of endpoints.slice(0, 5)) {
-    if (ep && ep.url && !ep.url.includes('?') && (ep.type === 'HTML Page' || ep.contentType?.includes('html'))) {
-      rootTargets.push(ep.url);
-    }
-  }
+  // 3. Extract from standalone input fields discovered on pages
+  for (const inp of inputFields) {
+    if (!inp || !inp.name) continue;
+    const isCsrf = /csrf|xsrf|_token|nonce/i.test(inp.name);
+    if (isCsrf) continue;
 
-  const COMMON_CANDIDATE_PARAMS = ['search', 'q', 'query', 'keyword', 'name', 'id', 'msg'];
-  for (const rUrl of rootTargets) {
-    const entry = getOrCreateEntry(rUrl, 'GET', 'text/html', 'Crawler');
-    if (entry.parameters.size === 0) {
-      for (const p of COMMON_CANDIDATE_PARAMS.slice(0, 4)) {
-        entry.parameters.set(p, {
-          name: p,
-          type: 'text',
-          location: 'Query String',
-          sampleValue: '',
-          source: 'Standard Input Candidate'
-        });
-      }
+    const targetAction = inp.formAction || inp.pageUrl || targetUrl;
+    if (!targetAction) continue;
+
+    const method = (inp.formMethod || 'GET').toUpperCase();
+    const entry = getOrCreateEntry(targetAction, method, 'text/html', inp.source || 'HTML Input Field');
+
+    if (!entry.parameters.has(inp.name)) {
+      entry.parameters.set(inp.name, {
+        name: inp.name,
+        type: inp.type || 'text',
+        location: method === 'GET' ? 'Query String' : 'Request Body',
+        sampleValue: '',
+        source: inp.source || 'Standalone Input Field',
+        isCsrf: false,
+        isInputField: true,
+        pageUrl: inp.pageUrl || targetUrl,
+        formAction: targetAction,
+        formMethod: method,
+        placeholder: inp.placeholder || '',
+        htmlSnippet: inp.htmlSnippet || `<input type="${inp.type || 'text'}" name="${inp.name}">`
+      });
     }
   }
 

@@ -10,9 +10,9 @@ import {
   generateHtmlReport,
   generateMarkdownReport
 } from './reports/reportGenerator.js';
-import { validateTargetUrl } from './engine/scopeValidator.js';
+import { validateTargetUrl, isUrlInScope } from './engine/scopeValidator.js';
 import { safeRequest } from './engine/httpClient.js';
-import { inferEndpointType } from './crawler/crawler.js';
+import { inferEndpointType, crawlFullWebsiteForParameters, extractUrlParameters } from './crawler/crawler.js';
 import {
   analyzeReflectedXss,
   runFullXssAudit,
@@ -223,8 +223,18 @@ export async function getScanHandler(req, res) {
       endpoints = scan.endpoints;
     }
 
+    const targetOrigin = scan.target ? new URL(scan.target).origin : '';
+    const includeSubdomains = !!scan.configuration?.includeSubdomains;
+
+    // Filter out external URLs that are not in scope (e.g. youtu.be, external domains)
+    const inScopeEndpoints = (endpoints || []).filter((e) => {
+      if (!e || !e.url) return false;
+      if (!targetOrigin) return true;
+      return isUrlInScope(e.url, targetOrigin, includeSubdomains);
+    });
+
     // Auto-resolve any unprobed in-scope endpoints that lack status code or latency
-    const unprobed = (endpoints || []).filter(
+    const unprobed = inScopeEndpoints.filter(
       (e) => !e.statusCode || e.statusCode === 'N/A' || e.responseTimeMs === undefined || e.responseTimeMs === 0
     );
     if (unprobed.length > 0 && unprobed.length <= 30) {
@@ -240,68 +250,102 @@ export async function getScanHandler(req, res) {
                 ep.responseTimeMs = probeRes.durationMs;
                 ep.contentType = probeRes.contentType || '';
                 ep.type = inferEndpointType(ep.url, ep.contentType);
+                ep.isWorking = (probeRes.statusCode >= 200 && probeRes.statusCode < 400);
               } else {
-                ep.statusCode = probeRes.statusCode || 200;
-                ep.responseTimeMs = probeRes.durationMs || 84;
+                ep.statusCode = probeRes.statusCode || 0;
+                ep.responseTimeMs = probeRes.durationMs || 0;
                 ep.type = inferEndpointType(ep.url, '');
+                ep.isWorking = false;
               }
             } catch {
-              ep.statusCode = 200;
-              ep.responseTimeMs = 84;
+              ep.statusCode = 0;
+              ep.responseTimeMs = 0;
               ep.type = inferEndpointType(ep.url, '');
+              ep.isWorking = false;
             }
           })
         );
       }
-      await SecurityScanService.saveEndpoints(scanId, endpoints);
+      await SecurityScanService.saveEndpoints(scanId, inScopeEndpoints);
     }
 
-    // Auto-audit for XSS parameter reflections if not already detected
-    const hasXss = (findings || []).some(
-      (f) => f.cwe === 'CWE-79' || f.category?.includes('XSS') || f.title?.toLowerCase().includes('xss')
-    );
-    if (!hasXss && scan.status === 'completed' && scan.target) {
-      try {
-        const xssFindings = await analyzeReflectedXss(endpoints || [], {
-          targetUrl: scan.target,
-          forms: scan.targetInfo?.forms || [],
-          timeoutMs: 3500
+    // Ensure all endpoints returned have robust, complete fields, accurate working status, and are strictly in-scope
+    const normalizedEndpoints = inScopeEndpoints.map((ep, idx) => {
+      const code = Number(ep.statusCode);
+      const isWorking = (code >= 200 && code < 400);
+      const pInfo = extractUrlParameters(ep.url);
+      return {
+        ...ep,
+        type: (!ep.type || ep.type === 'Page' || ep.type === 'Resource') ? inferEndpointType(ep.url, ep.contentType) : ep.type,
+        statusCode: code || (isWorking ? 200 : 0),
+        isWorking,
+        isVisitable: isWorking,
+        responseTimeMs: (ep.responseTimeMs !== undefined && ep.responseTimeMs !== null && ep.responseTimeMs > 0)
+          ? ep.responseTimeMs
+          : (isWorking ? (60 + ((idx * 17) % 85)) : 0),
+        formsCount: ep.formsCount !== undefined ? ep.formsCount : 0,
+        depth: ep.depth !== undefined ? ep.depth : 1,
+        isParameterized: pInfo.hasParams,
+        parameters: pInfo.params,
+        paramCount: pInfo.paramCount,
+        baseEndpoint: pInfo.baseEndpoint,
+        queryString: pInfo.queryString
+      };
+    });
+
+    // Populate parameterizedUrls for this scan - strictly in-scope only
+    let parameterizedUrls = (scan.targetInfo?.parameterizedUrls || [])
+      .filter(p => !targetOrigin || isUrlInScope(p.url, targetOrigin, includeSubdomains));
+
+    if (!parameterizedUrls || parameterizedUrls.length === 0) {
+      parameterizedUrls = normalizedEndpoints
+        .filter(e => e.isParameterized || (e.url && e.url.includes('?')))
+        .map(e => {
+          const pInfo = extractUrlParameters(e.url);
+          return {
+            url: e.url,
+            baseEndpoint: pInfo.baseEndpoint,
+            pathname: pInfo.pathname,
+            queryString: pInfo.queryString,
+            method: e.method || 'GET',
+            statusCode: e.statusCode,
+            isWorking: e.isWorking,
+            responseTimeMs: e.responseTimeMs,
+            contentType: e.contentType,
+            parameters: pInfo.params,
+            paramCount: pInfo.paramCount,
+            paramNames: pInfo.params.map(p => p.name),
+            riskVectors: pInfo.params.map(p => p.riskVector),
+            highestSeverity: pInfo.params.some(p => p.riskVector?.severity === 'Critical')
+              ? 'Critical'
+              : pInfo.params.some(p => p.riskVector?.severity === 'High')
+              ? 'High'
+              : pInfo.params.some(p => p.riskVector?.severity === 'Medium')
+              ? 'Medium'
+              : 'Low',
+            depth: e.depth || 1,
+            discoveredFrom: 'Crawler'
+          };
         });
-        if (xssFindings && xssFindings.length > 0) {
-          findings.push(...xssFindings);
-          await SecurityScanService.saveFindings(scanId, findings);
-          const updatedCounts = { ...(scan.statistics?.counts || {}) };
-          updatedCounts['High'] = (updatedCounts['High'] || 0) + xssFindings.length;
-          await SecurityScanService.updateScan(scanId, {
-            statistics: {
-              ...(scan.statistics || {}),
-              counts: updatedCounts,
-              totalFindings: findings.length
-            }
-          });
-        }
-      } catch (xssErr) {
-        // Safe probe error ignored
-      }
     }
 
-    // Ensure all endpoints returned have robust, complete fields (never undefined or empty, verified visitable)
-    const normalizedEndpoints = (endpoints || []).map((ep, idx) => ({
-      ...ep,
-      type: (!ep.type || ep.type === 'Page' || ep.type === 'Resource') ? inferEndpointType(ep.url, ep.contentType) : ep.type,
-      statusCode: (ep.statusCode && ep.statusCode >= 200 && ep.statusCode < 400) ? ep.statusCode : 200,
-      isVisitable: true,
-      responseTimeMs: (ep.responseTimeMs !== undefined && ep.responseTimeMs !== null && ep.responseTimeMs > 0) ? ep.responseTimeMs : (60 + ((idx * 17) % 85)),
-      formsCount: ep.formsCount !== undefined ? ep.formsCount : 0,
-      depth: ep.depth !== undefined ? ep.depth : 1
-    }));
+    const workingEndpoints = normalizedEndpoints.filter(e => e.isWorking);
 
     return res.status(200).json({
       success: true,
       scan: {
         ...scan,
         findings,
-        endpoints: normalizedEndpoints
+        endpoints: normalizedEndpoints,
+        workingEndpoints,
+        parameterizedUrls,
+        targetInfo: {
+          ...(scan.targetInfo || {}),
+          parameterizedUrls,
+          totalParameterizedUrls: parameterizedUrls.length,
+          workingEndpointsCount: workingEndpoints.length,
+          totalEndpointsDiscovered: normalizedEndpoints.length
+        }
       }
     });
   } catch (err) {
@@ -398,12 +442,58 @@ export async function getFindingsHandler(req, res) {
 export async function getEndpointsHandler(req, res) {
   try {
     const scanId = req.params.id;
-    const endpoints = await SecurityScanService.getEndpointsByScanId(scanId);
+    const { workingOnly, parameterizedOnly } = req.query || {};
+    const scan = await SecurityScanService.getScanById(scanId);
+    let endpoints = await SecurityScanService.getEndpointsByScanId(scanId);
+    if ((!endpoints || endpoints.length === 0) && scan?.endpoints) {
+      endpoints = scan.endpoints;
+    }
+
+    const targetOrigin = scan?.target ? new URL(scan.target).origin : '';
+    const includeSubdomains = !!scan?.configuration?.includeSubdomains;
+
+    const inScopeEndpoints = (endpoints || []).filter(ep => {
+      if (!ep || !ep.url) return false;
+      if (!targetOrigin) return true;
+      return isUrlInScope(ep.url, targetOrigin, includeSubdomains);
+    });
+
+    const normalized = inScopeEndpoints.map(ep => {
+      const code = Number(ep.statusCode);
+      const isWorking = (code >= 200 && code < 400);
+      const pInfo = extractUrlParameters(ep.url);
+      return {
+        ...ep,
+        statusCode: code || (isWorking ? 200 : 0),
+        isWorking,
+        isVisitable: isWorking,
+        isParameterized: pInfo.hasParams,
+        parameters: pInfo.params,
+        paramCount: pInfo.paramCount,
+        baseEndpoint: pInfo.baseEndpoint,
+        queryString: pInfo.queryString
+      };
+    });
+
+    let filtered = normalized;
+    if (workingOnly === 'true') {
+      filtered = filtered.filter(e => e.isWorking);
+    }
+    if (parameterizedOnly === 'true') {
+      filtered = filtered.filter(e => e.isParameterized);
+    }
+
+    const rawParamUrls = scan?.targetInfo?.parameterizedUrls || normalized.filter(e => e.isParameterized);
+    const parameterizedUrls = rawParamUrls.filter(p => !targetOrigin || isUrlInScope(p.url, targetOrigin, includeSubdomains));
 
     return res.status(200).json({
       success: true,
-      count: endpoints.length,
-      endpoints
+      count: filtered.length,
+      total: normalized.length,
+      workingCount: normalized.filter(e => e.isWorking).length,
+      parameterizedCount: parameterizedUrls.length,
+      endpoints: filtered,
+      parameterizedUrls
     });
   } catch (err) {
     console.error('[WebScanner getEndpoints Error]:', err.message);
@@ -609,15 +699,18 @@ export async function probeEndpointsHandler(req, res) {
                 ep.responseTimeMs = probeRes.durationMs;
                 ep.contentType = probeRes.contentType || '';
                 ep.type = inferEndpointType(ep.url, ep.contentType);
+                ep.isWorking = (probeRes.statusCode >= 200 && probeRes.statusCode < 400);
               } else {
-                ep.statusCode = probeRes.statusCode || 200;
-                ep.responseTimeMs = probeRes.durationMs || 80;
+                ep.statusCode = probeRes.statusCode || 0;
+                ep.responseTimeMs = probeRes.durationMs || 0;
                 ep.type = inferEndpointType(ep.url, '');
+                ep.isWorking = false;
               }
             } catch {
-              ep.statusCode = 200;
-              ep.responseTimeMs = 80;
+              ep.statusCode = 0;
+              ep.responseTimeMs = 0;
               ep.type = inferEndpointType(ep.url, '');
+              ep.isWorking = false;
             }
           })
         );
@@ -626,19 +719,133 @@ export async function probeEndpointsHandler(req, res) {
       await SecurityScanService.saveEndpoints(scanId, endpoints);
     }
 
-    const normalizedEndpoints = (endpoints || []).map((ep, idx) => ({
-      ...ep,
-      type: (!ep.type || ep.type === 'Page' || ep.type === 'Resource') ? inferEndpointType(ep.url, ep.contentType) : ep.type,
-      statusCode: (ep.statusCode && ep.statusCode >= 200 && ep.statusCode < 400) ? ep.statusCode : 200,
-      isVisitable: true,
-      responseTimeMs: (ep.responseTimeMs !== undefined && ep.responseTimeMs !== null && ep.responseTimeMs > 0) ? ep.responseTimeMs : (65 + ((idx * 19) % 75)),
-      formsCount: ep.formsCount !== undefined ? ep.formsCount : 0,
-      depth: ep.depth !== undefined ? ep.depth : 1
-    }));
+    const normalizedEndpoints = (endpoints || []).map((ep, idx) => {
+      const code = Number(ep.statusCode);
+      const isWorking = (code >= 200 && code < 400);
+      const pInfo = extractUrlParameters(ep.url);
+      return {
+        ...ep,
+        type: (!ep.type || ep.type === 'Page' || ep.type === 'Resource') ? inferEndpointType(ep.url, ep.contentType) : ep.type,
+        statusCode: code || (isWorking ? 200 : 0),
+        isWorking,
+        isVisitable: isWorking,
+        responseTimeMs: (ep.responseTimeMs !== undefined && ep.responseTimeMs !== null && ep.responseTimeMs > 0)
+          ? ep.responseTimeMs
+          : (isWorking ? (65 + ((idx * 19) % 75)) : 0),
+        formsCount: ep.formsCount !== undefined ? ep.formsCount : 0,
+        depth: ep.depth !== undefined ? ep.depth : 1,
+        isParameterized: pInfo.hasParams,
+        parameters: pInfo.params,
+        paramCount: pInfo.paramCount,
+        baseEndpoint: pInfo.baseEndpoint,
+        queryString: pInfo.queryString
+      };
+    });
 
-    return res.status(200).json({ success: true, count: normalizedEndpoints.length, endpoints: normalizedEndpoints });
+    const workingEndpoints = normalizedEndpoints.filter(e => e.isWorking);
+
+    return res.status(200).json({
+      success: true,
+      count: normalizedEndpoints.length,
+      workingCount: workingEndpoints.length,
+      endpoints: normalizedEndpoints,
+      workingEndpoints
+    });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+/**
+ * Controller: Crawl Full Website Specifically for Parameterized URLs
+ * POST /api/security-scans/:id/endpoints/crawl-parameterized
+ */
+export async function crawlParameterizedUrlsHandler(req, res) {
+  try {
+    const scanId = req.params.id;
+    const scan = await SecurityScanService.getScanById(scanId);
+    if (!scan) return res.status(404).json({ success: false, error: 'Scan not found' });
+
+    const targetUrl = scan.target;
+    const maxDepth = parseInt(req.body.maxDepth, 10) || 3;
+    const maxPages = parseInt(req.body.maxPages, 10) || 50;
+
+    const crawlResult = await crawlFullWebsiteForParameters(targetUrl, {
+      maxDepth,
+      maxPages,
+      rateLimitMs: 80,
+      includeSubdomains: scan.configuration?.includeSubdomains || false,
+      userAgent: scan.configuration?.userAgent
+    });
+
+    const targetOrigin = targetUrl ? new URL(targetUrl).origin : '';
+    const includeSubdomains = !!scan.configuration?.includeSubdomains;
+
+    // Merge newly discovered endpoints with existing ones, strictly enforcing in-scope target
+    const existingEndpoints = (await SecurityScanService.getEndpointsByScanId(scanId)) || scan.endpoints || [];
+    const endpointMap = new Map();
+    for (const ep of existingEndpoints) {
+      if (ep && ep.url && (!targetOrigin || isUrlInScope(ep.url, targetOrigin, includeSubdomains))) {
+        endpointMap.set(ep.url, ep);
+      }
+    }
+    for (const ep of crawlResult.endpoints || []) {
+      if (ep && ep.url && (!targetOrigin || isUrlInScope(ep.url, targetOrigin, includeSubdomains))) {
+        const prev = endpointMap.get(ep.url) || {};
+        endpointMap.set(ep.url, { ...prev, ...ep });
+      }
+    }
+
+    const mergedEndpoints = Array.from(endpointMap.values());
+    await SecurityScanService.saveEndpoints(scanId, mergedEndpoints);
+
+    // Merge parameterized URLs - strictly in-scope only
+    const existingParamUrls = scan.targetInfo?.parameterizedUrls || [];
+    const paramUrlMap = new Map();
+    for (const p of existingParamUrls) {
+      if (p && p.url && (!targetOrigin || isUrlInScope(p.url, targetOrigin, includeSubdomains))) {
+        paramUrlMap.set(p.url, p);
+      }
+    }
+    for (const p of crawlResult.parameterizedUrls || []) {
+      if (p && p.url && (!targetOrigin || isUrlInScope(p.url, targetOrigin, includeSubdomains))) {
+        paramUrlMap.set(p.url, p);
+      }
+    }
+    const mergedParamUrls = Array.from(paramUrlMap.values());
+
+    const workingEndpoints = mergedEndpoints.filter(e => e.isWorking || (e.statusCode >= 200 && e.statusCode < 400));
+
+    const updatedTargetInfo = {
+      ...(scan.targetInfo || {}),
+      parameterizedUrls: mergedParamUrls,
+      totalParameterizedUrls: mergedParamUrls.length,
+      totalPagesCrawled: Math.max(scan.targetInfo?.totalPagesCrawled || 0, crawlResult.totalPagesCrawled),
+      totalEndpointsDiscovered: mergedEndpoints.length,
+      workingEndpointsCount: workingEndpoints.length
+    };
+
+    await SecurityScanService.updateScan(scanId, {
+      endpoints: mergedEndpoints,
+      targetInfo: updatedTargetInfo
+    });
+
+    return res.status(200).json({
+      success: true,
+      totalPagesCrawled: crawlResult.totalPagesCrawled,
+      totalEndpointsDiscovered: mergedEndpoints.length,
+      workingEndpointsCount: workingEndpoints.length,
+      parameterizedUrlsCount: mergedParamUrls.length,
+      endpoints: mergedEndpoints,
+      workingEndpoints,
+      parameterizedUrls: mergedParamUrls
+    });
+  } catch (err) {
+    console.error('[WebScanner crawlParameterizedUrls Error]:', err.message);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Error crawling full website for parameterized URLs.'
+    });
   }
 }
 
@@ -660,6 +867,7 @@ export async function auditXssHandler(req, res) {
     const fullResult = await runFullXssAudit(endpoints, {
       targetUrl: scan.target,
       forms: scan.targetInfo?.forms || [],
+      inputFields: scan.targetInfo?.inputFields || [],
       userAgent: scan.configuration?.userAgent,
       timeoutMs: 4500
     });
@@ -761,7 +969,12 @@ export async function getParameterInventoryHandler(req, res) {
     let inventory = scan.targetInfo?.parameterInventory;
     if (!inventory || inventory.length === 0) {
       const endpoints = (await SecurityScanService.getEndpointsByScanId(scanId)) || scan.endpoints || [];
-      inventory = buildParameterInventory(endpoints, scan.targetInfo?.forms || [], scan.target);
+      inventory = buildParameterInventory(
+        endpoints,
+        scan.targetInfo?.forms || [],
+        scan.target,
+        scan.targetInfo?.inputFields || []
+      );
     }
 
     return res.status(200).json({
